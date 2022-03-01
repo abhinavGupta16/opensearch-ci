@@ -11,13 +11,16 @@ import {
   AmazonLinuxGeneration, BlockDeviceVolume, CloudFormationInit, InitCommand, InitElement, InitFile, InitPackage, Instance,
   InstanceClass, InstanceSize, InstanceType, MachineImage, SecurityGroup, SubnetType, Vpc,
 } from '@aws-cdk/aws-ec2';
-import { ManagedPolicy, PolicyStatement } from '@aws-cdk/aws-iam';
+import {
+  Effect, IManagedPolicy, ManagedPolicy, PolicyStatement, Role, ServicePrincipal,
+} from '@aws-cdk/aws-iam';
 import { Metric, Unit } from '@aws-cdk/aws-cloudwatch';
 import { join } from 'path';
 import { CloudwatchAgent } from '../constructs/cloudwatch-agent';
 import { JenkinsPlugins } from './jenkins-plugins';
 import { AgentNode, AgentNodeProps } from './agent-nodes';
 import { CloudAgentNodeConfig } from './agent-node-config';
+import { JenkinsMainNodeConfig } from './jenkins-main-node-config';
 
 interface HttpConfigProps {
   readonly redirectUrlArn: string;
@@ -30,9 +33,14 @@ interface HttpConfigProps {
 interface OidcFederateProps {
   readonly oidcCredArn: string;
   readonly runWithOidc: boolean;
+  readonly adminUsers?: Array<String>;
 }
 
-export interface JenkinsMainNodeProps extends HttpConfigProps, OidcFederateProps{
+interface EcrStackProps {
+  readonly ecrAccountId: string
+}
+
+export interface JenkinsMainNodeProps extends HttpConfigProps, OidcFederateProps, EcrStackProps {
   readonly vpc: Vpc;
   readonly sg: SecurityGroup;
   readonly failOnCloudInitError?: boolean;
@@ -74,11 +82,52 @@ export class JenkinsMainNode {
       }),
     };
 
+    const agentNode = new AgentNode(stack);
+    this.ec2Instance = new Instance(stack, 'MainNode', {
+
+      instanceType: InstanceType.of(InstanceClass.C5, InstanceSize.XLARGE4),
+      machineImage: MachineImage.latestAmazonLinux({
+        generation: AmazonLinuxGeneration.AMAZON_LINUX_2,
+      }),
+      role: new Role(stack, 'OpenSearch-CI-MainNodeRole', {
+        roleName: 'OpenSearch-CI-MainNodeRole',
+        assumedBy: new ServicePrincipal('ec2.amazonaws.com'),
+      }),
+      initOptions: {
+        timeout: Duration.minutes(20),
+        ignoreFailures: props.failOnCloudInitError ?? true,
+      },
+      vpc: props.vpc,
+      vpcSubnets: {
+        subnetType: SubnetType.PRIVATE_WITH_NAT,
+      },
+      securityGroup: props.sg,
+      init: CloudFormationInit.fromElements(...JenkinsMainNode.configElements(
+        stack.stackName,
+        stack.region,
+        props,
+      ), ...agentNode.configElements(stack.region, agentNodeProps, agentNodeConfig.AL2_X64, agentNodeConfig.AL2_ARM64),
+      ...JenkinsMainNode.configOidcElements(stack.region, props)),
+      blockDevices: [{
+        deviceName: '/dev/xvda',
+        volume: BlockDeviceVolume.ebs(100, { encrypted: true, deleteOnTermination: true }),
+      }],
+    });
+
+    JenkinsMainNode.createPoliciesForMainNode(stack, props).map(
+      (policy) => this.ec2Instance.role.addManagedPolicy(policy),
+    );
+  }
+
+  public static createPoliciesForMainNode(stack: Stack, ecrStackProps: EcrStackProps) : (IManagedPolicy | ManagedPolicy)[] {
+    const policies: (IManagedPolicy | ManagedPolicy)[] = [];
+
     // Policy for SSM management of the host - Removes the need of SSH keys
     const ec2SsmManagementPolicy = ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore');
 
     // Policy for EC2 instance to publish logs and metrics to cloudwatch
     const cloudwatchEventPublishingPolicy = ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy');
+
     const accessPolicy = ManagedPolicy.fromAwsManagedPolicyName('SecretsManagerReadWrite');
 
     // Main jenkins node will start/stop agent ec2 instances to run build jobs
@@ -115,40 +164,20 @@ export class JenkinsMainNode {
           resources: ['*'],
         })],
       });
-    const agentNode = new AgentNode(stack);
-    this.ec2Instance = new Instance(stack, 'MainNode', {
 
-      instanceType: InstanceType.of(InstanceClass.C5, InstanceSize.XLARGE4),
-      machineImage: MachineImage.latestAmazonLinux({
-        generation: AmazonLinuxGeneration.AMAZON_LINUX_2,
-      }),
-      initOptions: {
-        timeout: Duration.minutes(20),
-        ignoreFailures: props.failOnCloudInitError ?? true,
-      },
-      vpc: props.vpc,
-      vpcSubnets: {
-        subnetType: SubnetType.PRIVATE_WITH_NAT,
-      },
-      securityGroup: props.sg,
-      init: CloudFormationInit.fromElements(...JenkinsMainNode.configElements(
-        stack.stackName,
-        stack.region,
-        props,
-        props,
-      ), ...agentNode.configElements(stack.region, agentNodeProps, agentNodeConfig.AL2_X64, agentNodeConfig.AL2_ARM64)),
-      blockDevices: [{
-        deviceName: '/dev/xvda',
-        volume: BlockDeviceVolume.ebs(100, { encrypted: true, deleteOnTermination: true }),
-      }],
+    const ecrPolicy = new ManagedPolicy(stack, 'ecr-policy-main-node', {
+      description: 'Policy for ECR to assume role',
+      statements: [new PolicyStatement({
+        actions: ['sts:AssumeRole'],
+        effect: Effect.ALLOW,
+        resources: [`arn:aws:iam::${ecrStackProps.ecrAccountId}:role/OpenSearch-CI-ECR-ecr-role`],
+      })],
     });
-    this.ec2Instance.role.addManagedPolicy(ec2SsmManagementPolicy);
-    this.ec2Instance.role.addManagedPolicy(cloudwatchEventPublishingPolicy);
-    this.ec2Instance.role.addManagedPolicy(mainJenkinsNodePolicy);
-    this.ec2Instance.role.addManagedPolicy(accessPolicy);
+
+    return [ec2SsmManagementPolicy, cloudwatchEventPublishingPolicy, accessPolicy, mainJenkinsNodePolicy, ecrPolicy];
   }
 
-  public static configElements(stackName: string, stackRegion: string, httpConfigProps: HttpConfigProps, oidcFederateProps: OidcFederateProps): InitElement[] {
+  public static configElements(stackName: string, stackRegion: string, httpConfigProps: HttpConfigProps): InitElement[] {
     return [
       InitPackage.yum('curl'),
       InitPackage.yum('wget'),
@@ -171,10 +200,6 @@ export class JenkinsMainNode {
 
       InitCommand.shellCommand('sleep 60'),
 
-      InitCommand.shellCommand(oidcFederateProps.runWithOidc
-        ? 'amazon-linux-extras install epel -y && yum -y install xmlstarlet'
-        : 'echo not installing xmlstarlet as not running with OIDC'),
-
       // Jenkins needs to be accessible for httpd proxy
       InitCommand.shellCommand('sed -i \'s@JENKINS_LISTEN_ADDRESS=""@JENKINS_LISTEN_ADDRESS="127.0.0.1"@g\' /etc/sysconfig/jenkins'),
 
@@ -193,8 +218,7 @@ export class JenkinsMainNode {
         ? `mkdir /etc/ssl/private/ && aws --region ${stackRegion} secretsmanager get-secret-value --secret-id ${httpConfigProps.sslCertPrivateKeyContentsArn} --query SecretString --output text  > ${JenkinsMainNode.PRIVATE_KEY_PATH}`
         : 'echo useSsl is false, not creating key file'),
 
-      // Local reverse proxy is used, see design for details
-      // https://quip-amazon.com/jjIKA6tIPQbw/ODFE-Jenkins-Production-Cluster-JPC-High-Level-Design#BeF9CAIwx3k
+      // Local reverse proxy is used
       InitPackage.yum('httpd'),
 
       // Configuration to proxy jenkins on :8080 -> :80
@@ -326,7 +350,7 @@ export class JenkinsMainNode {
       // Commands are fired one after the other but it does not wait for the command to complete.
       // Therefore, sleep 60 seconds to wait for jenkins to start
       // This allows jenkins to generate the secrets files used for auth in jenkins-cli APIs
-      InitCommand.shellCommand('sleep 60'),
+      InitCommand.shellCommand('sleep 65'),
 
       // creating a default  user:password file to use to authenticate the jenkins-cli
       // eslint-disable-next-line max-len
@@ -346,24 +370,66 @@ export class JenkinsMainNode {
 
       InitFile.fromFileInline('/var/lib/jenkins/jenkins.yaml', join(__dirname, '../../resources/jenkins.yaml')),
 
-      // If devMode is false, first line extracts the oidcFederateProps as json from the secret manager
-      // xmlstarlet is used to setup the securityRealm values for oidc by editing the jenkins' config.xml file
+    ];
+  }
+
+  public static configOidcElements(stackRegion: string, oidcFederateProps: OidcFederateProps): InitElement[] {
+    const RELOAD_CONFIG: string = 'java -jar /jenkins-cli.jar -s http://localhost:8080'
+      + ` -auth @${JenkinsMainNode.JENKINS_DEFAULT_ID_PASS_PATH} reload-configuration`;
+    return [
+
+      InitCommand.shellCommand(oidcFederateProps.runWithOidc
+        ? 'amazon-linux-extras install epel -y && yum -y install xmlstarlet'
+        : 'echo not installing xmlstarlet as not running with OIDC'),
+
+      // Enabling Role Based Authentication with admin and read-only role
+      InitCommand.shellCommand(oidcFederateProps.runWithOidc
+        ? 'xmlstarlet ed -L -d /hudson/authorizationStrategy'
+        + ' -s /hudson -t elem -n authorizationStrategy -v " "'
+        + ' -i //authorizationStrategy -t attr -n "class" -v "com.michelin.cio.hudson.plugins.rolestrategy.RoleBasedAuthorizationStrategy"'
+        + ' -s /hudson/authorizationStrategy -t elem -n roleMap'
+        + ' -i /hudson/authorizationStrategy/roleMap -t attr -n "type" -v "projectRoles"'
+        + ' -s /hudson/authorizationStrategy --type elem -n roleMap'
+        + ' -i /hudson/authorizationStrategy/roleMap[2] -t attr -n "type" -v "globalRoles"'
+        + ' -s /hudson/authorizationStrategy/roleMap[2] -t elem -n role -v " "'
+        + ' -i /hudson/authorizationStrategy/roleMap[2]/role -t attr -n "name" -v "admin"'
+        + ' -i /hudson/authorizationStrategy/roleMap[2]/role -t attr -n "pattern" -v ".*"'
+        + ' -s /hudson/authorizationStrategy/roleMap[2]/role -t elem -n permissions -v " "'
+        // eslint-disable-next-line max-len
+        + `${JenkinsMainNodeConfig.adminRolePermissions().map((e) => ` -s /hudson/authorizationStrategy/roleMap[2]/role/permissions -t elem -n "permission" -v ${e}`).join(' ')}`
+        + ' -s /hudson/authorizationStrategy/roleMap[2]/role -t elem -n "assignedSIDs" -v " " '
+        // eslint-disable-next-line max-len
+        + `${this.admins(oidcFederateProps.adminUsers).map(((e) => ` -s /hudson/authorizationStrategy/roleMap[2]/role/assignedSIDs -t elem -n "sid" -v ${e}`)).join(' ')}`
+        + ' -s /hudson/authorizationStrategy --type elem -n roleMap'
+        + ' -i /hudson/authorizationStrategy/roleMap[3] -t attr -n "type" -v "slaveRolesRoles"'
+        + ' -s /hudson/authorizationStrategy/roleMap[2] -t elem -n role -v " "'
+        + ' -i /hudson/authorizationStrategy/roleMap[2]/role[2] -t attr -n "name" -v "read-only"'
+        + ' -i /hudson/authorizationStrategy/roleMap[2]/role[2] -t attr -n "pattern" -v ".*"'
+        + ' -s /hudson/authorizationStrategy/roleMap[2]/role[2] -t elem -n permissions -v " "'
+        // eslint-disable-next-line max-len
+        + `${JenkinsMainNodeConfig.readOnlyRolePermissions().map((e) => ` -s /hudson/authorizationStrategy/roleMap[2]/role[2]/permissions -t elem -n "permission" -v ${e}`).join(' ')}`
+        + ' -s /hudson/authorizationStrategy/roleMap[2]/role[2] -t elem -n "assignedSIDs" -v " "'
+        + ' -s /hudson/authorizationStrategy/roleMap[2]/role[2]/assignedSIDs -t elem -n "sid" -v "anonymous"'
+        + ' /var/lib/jenkins/config.xml'
+        + ` && ${RELOAD_CONFIG}`
+        : 'echo OIDC disabled: Not enabling Role Based Authentication'),
+
+      // sleep for 30s before editing config.xml again
+      InitCommand.shellCommand('sleep 30'),
+
+      // Enabling OIDC
       InitCommand.shellCommand(oidcFederateProps.runWithOidc
         // eslint-disable-next-line max-len
         ? `var=\`aws --region ${stackRegion} secretsmanager get-secret-value --secret-id ${oidcFederateProps.oidcCredArn} --query SecretString --output text\` && `
-        + 'xmlstarlet ed -L -d "/hudson/securityRealm" '
-        + '-s /hudson -t elem -n securityRealm -v " " '
-        + '-i //securityRealm -t attr -n "class" -v "org.jenkinsci.plugins.oic.OicSecurityRealm" '
-        + '-i //securityRealm -t attr -n "plugin" -v "oic-auth@1.8" '
+        + ' xmlstarlet ed -L -d "/hudson/securityRealm"'
+        + ' -s /hudson -t elem -n securityRealm -v " "'
+        + ' -i //securityRealm -t attr -n "class" -v "org.jenkinsci.plugins.oic.OicSecurityRealm"'
+        + ' -i //securityRealm -t attr -n "plugin" -v "oic-auth@1.8"'
         // eslint-disable-next-line max-len
-        + `${this.oidcConfigFields().map((e) => ` -s /hudson/securityRealm -t elem -n ${e[0]} -v ${e[1] === 'replace' ? `"$(echo $var | jq -r ".${e[0]}")"` : `"${e[1]}"`}`).join(' ')}`
+        + `${JenkinsMainNodeConfig.oidcConfigFields().map((e) => ` -s /hudson/securityRealm -t elem -n ${e[0]} -v ${e[1] === 'replace' ? `"$(echo $var | jq -r ".${e[0]}")"` : `"${e[1]}"`}`).join(' ')}`
         + ' /var/lib/jenkins/config.xml'
-        : 'echo Not altering the jenkins config.xml when not running with OIDC'),
-
-      // reloading jenkins config file
-      InitCommand.shellCommand(oidcFederateProps.runWithOidc
-        ? `java -jar /jenkins-cli.jar -s http://localhost:8080 -auth @${JenkinsMainNode.JENKINS_DEFAULT_ID_PASS_PATH} reload-configuration`
-        : 'echo not reloading jenkins config when not running with OIDC'),
+        + ` && ${RELOAD_CONFIG}`
+        : 'echo OIDC disabled: Not changing the configuration'),
     ];
   }
 
@@ -383,19 +449,13 @@ export class JenkinsMainNode {
     });
   }
 
-  public static oidcConfigFields() : string[][] {
-    return [['clientId', 'replace'],
-      ['clientSecret', 'replace'],
-      ['wellKnownOpenIDConfigurationUrl', 'replace'],
-      ['tokenServerUrl', 'replace'],
-      ['authorizationServerUrl', 'replace'],
-      ['userInfoServerUrl', 'replace'],
-      ['userNameField', 'sub'],
-      ['scopes', 'openid'],
-      ['disableSslVerification', 'false'],
-      ['logoutFromOpenidProvider', 'true'],
-      ['postLogoutRedirectUrl', ''],
-      ['escapeHatchEnabled', 'false'],
-      ['escapeHatchSecret', 'random']];
+  /** Adds user provided admin users along with default 'admin' */
+  public static admins(additionalAdminUsers?: any): String[] {
+    const adminUsers = ['admin'];
+    if (additionalAdminUsers) {
+      const addedAdminUsers = adminUsers.concat(additionalAdminUsers);
+      return addedAdminUsers;
+    }
+    return adminUsers;
   }
 }
